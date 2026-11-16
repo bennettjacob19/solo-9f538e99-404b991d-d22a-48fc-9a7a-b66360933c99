@@ -30,6 +30,7 @@ class Settings:
     """
 
     backend_url: str = "http://127.0.0.1:9000/v1/embeddings"
+    backend_revision_url: str = ""
     backend_model: str = "local-demo"
     backend_api_key: str | None = None
     backend_timeout_seconds: float = 30.0
@@ -47,6 +48,9 @@ class Settings:
         return cls(
             backend_url=os.getenv(
                 "EMBEDDING_BACKEND_URL", cls.backend_url
+            ),
+            backend_revision_url=os.getenv(
+                "EMBEDDING_BACKEND_REVISION_URL", cls.backend_revision_url
             ),
             backend_model=os.getenv("EMBEDDING_MODEL", cls.backend_model),
             backend_api_key=os.getenv("EMBEDDING_API_KEY") or None,

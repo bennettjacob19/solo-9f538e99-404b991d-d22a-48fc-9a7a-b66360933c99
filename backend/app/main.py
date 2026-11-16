@@ -2,12 +2,22 @@
 
 Endpoints
 ---------
-POST /v1/embeddings   OpenAI-compatible embeddings endpoint.
-GET  /healthz         Liveness probe.
-GET  /admin/stats     Actual batching/concurrency counters and request log.
-POST /admin/config    Change delay/error behaviour at runtime.
-POST /admin/reset     Clear counters and logs (not the config).
-GET  /docs            Interactive docs, including the admin endpoints.
+POST /v1/embeddings        OpenAI-compatible embeddings endpoint.
+GET  /v1/model/revision    The *current* model revision only.
+GET  /healthz              Liveness probe.
+GET  /admin/stats          Actual batching/concurrency counters and request log.
+POST /admin/config         Change delay/error behaviour at runtime.
+POST /admin/revision       Switch the current model revision.
+POST /admin/reset          Clear counters and logs (not the config/revision).
+GET  /docs                 Interactive docs, including the admin endpoints.
+
+Model revisions
+---------------
+Every revision uses the same dimension but produces different vectors.  Each
+``POST /v1/embeddings`` captures the revision when inference *starts* and
+reports it in the response; a revision switch during the simulated delay never
+rewrites that in-flight result.  Only the current revision is exposed -- the
+backend keeps no history of old revisions.
 
 The backend records how many requests it is actually serving at once.  Since
 the gateway is supposed to be single-flight against this backend, any value
@@ -74,8 +84,14 @@ class BackendConfigPatch(BaseModel):
     max_inputs: int | None = Field(default=None, ge=1, le=1024)
 
 
-def make_embedding(text: str, dim: int) -> list[float]:
-    digest = hashlib.sha256(text.encode("utf-8")).digest()
+def make_embedding(text: str, dim: int, revision: str = "r1") -> list[float]:
+    """Deterministic vector; different revisions give different vectors.
+
+    The revision is mixed into the hash so the dimension stays the same while
+    the values change, which is exactly the situation that must not be mixed
+    inside one index.
+    """
+    digest = hashlib.sha256(f"{revision}\x00{text}".encode()).digest()
     values: list[float] = []
     while len(values) < dim:
         for byte in digest:
@@ -97,6 +113,8 @@ class BackendState:
             max_inputs=_env_int("MOCK_MAX_INPUTS", 8),
         )
         self.dim = _env_int("MOCK_DIM", 8)
+        self.revision = os.getenv("MOCK_REVISION", "r1")
+        self.revision_switches = 0
         self.current = 0
         self.max_concurrency = 0
         self.concurrency_violations = 0
@@ -114,6 +132,8 @@ class BackendState:
         return {
             "config": self.config.model_dump(),
             "dim": self.dim,
+            "revision": self.revision,
+            "revision_switches": self.revision_switches,
             "current_concurrency": self.current,
             "max_concurrency": self.max_concurrency,
             "concurrency_violations": self.concurrency_violations,
@@ -192,6 +212,34 @@ async def admin_reset() -> dict[str, Any]:
     return state.snapshot()
 
 
+class RevisionSwitch(BaseModel):
+    revision: str = Field(min_length=1, max_length=64)
+
+
+@app.get(
+    "/v1/model/revision",
+    tags=["model"],
+    summary="Return the current model revision (only the current one is kept)",
+)
+async def model_revision() -> dict[str, str]:
+    return {"revision": state.revision}
+
+
+@app.post(
+    "/admin/revision",
+    tags=["admin"],
+    summary="Switch the current model revision",
+)
+async def admin_revision(switch: RevisionSwitch) -> dict[str, Any]:
+    revision = switch.revision.strip()
+    if not revision:
+        return _error(400, "revision must not be blank")
+    state.revision = revision
+    state.revision_switches += 1
+    logger.info("model revision switched to %s", revision)
+    return {"revision": state.revision, "dim": state.dim}
+
+
 @app.post(
     "/v1/embeddings",
     tags=["embeddings"],
@@ -215,6 +263,10 @@ async def embeddings(request: Request) -> Any:
         return _error(400, "input must not be empty")
 
     model = body.get("model") or "local-demo"
+
+    # Pin the revision when inference starts.  A switch during the simulated
+    # delay must not rewrite the result of an inference that already began.
+    revision = state.revision
 
     # Concurrency accounting (single-threaded event loop => atomic updates).
     state.current += 1
@@ -241,6 +293,7 @@ async def embeddings(request: Request) -> Any:
         "texts": texts,
         "batch_size": len(texts),
         "model": model,
+        "revision": revision,
         "concurrency_at_entry": concurrency_at_entry,
         "status": None,
         "ended_at": None,
@@ -283,7 +336,7 @@ async def embeddings(request: Request) -> Any:
             {
                 "object": "embedding",
                 "index": index,
-                "embedding": make_embedding(text, state.dim),
+                "embedding": make_embedding(text, state.dim, revision),
             }
             for index, text in enumerate(texts_for_response)
         ]
@@ -299,6 +352,7 @@ async def embeddings(request: Request) -> Any:
             "object": "list",
             "data": data,
             "model": model,
+            "revision": revision,
             "usage": {"prompt_tokens": sum(len(t) for t in texts)},
         }
     except Exception as exc:

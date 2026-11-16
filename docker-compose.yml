@@ -11,6 +11,7 @@ services:
       MOCK_SHUFFLE_RESPONSE: "${MOCK_SHUFFLE_RESPONSE:-false}"
       MOCK_MAX_INPUTS: "${MOCK_MAX_INPUTS:-8}"
       MOCK_DIM: "${MOCK_DIM:-8}"
+      MOCK_REVISION: "${MOCK_REVISION:-r1}"
     ports:
       - "${BACKEND_PORT:-9000}:9000"
     healthcheck:
@@ -30,6 +31,7 @@ services:
     image: embedding-batch-gateway:latest
     environment:
       EMBEDDING_BACKEND_URL: "http://backend:9000/v1/embeddings"
+      EMBEDDING_BACKEND_REVISION_URL: "http://backend:9000/v1/model/revision"
       EMBEDDING_MODEL: "${EMBEDDING_MODEL:-local-demo}"
       EMBEDDING_BACKEND_TIMEOUT_SECONDS: "${EMBEDDING_BACKEND_TIMEOUT_SECONDS:-30}"
       GATEWAY_BATCH_WINDOW_MS: "${GATEWAY_BATCH_WINDOW_MS:-20}"

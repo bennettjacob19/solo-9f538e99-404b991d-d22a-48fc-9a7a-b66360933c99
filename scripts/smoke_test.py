@@ -151,6 +151,143 @@ async def main(gateway: str, backend: str) -> int:
         )
         check("timeout_ms=0 rejected", zero_timeout.status_code == 422)
 
+        # 5. Corpus index: query without an index is explicitly rejected.
+        await client.post(f"{backend}/admin/config", json={"delay_ms": 0, "mode": "ok"})
+        await client.post(f"{backend}/admin/revision", json={"revision": "smoke-r1"})
+        no_index = await client.post(
+            f"{gateway}/v1/index/query", json={"query": "anything"}
+        )
+        check(
+            "query without index -> index_unavailable",
+            no_index.status_code == 503
+            and no_index.json().get("error", {}).get("code") == "index_unavailable",
+            no_index.text,
+        )
+
+        # 6. Build a 20-document corpus (multiple batches) and query it.
+        await client.post(f"{backend}/admin/reset")
+        await client.post(f"{backend}/admin/config", json={"delay_ms": 100})
+        docs = [
+            {"id": f"doc-{i}", "text": f"smoke document number {i}"}
+            for i in range(20)
+        ]
+        built = await client.post(
+            f"{gateway}/v1/index/build",
+            json={"documents": docs, "timeout_ms": 10000},
+        )
+        check("corpus build returns 200", built.status_code == 200, built.text)
+        build_body = built.json()
+        check(
+            "build pins the current revision",
+            build_body.get("model_revision") == "smoke-r1",
+            str(build_body.get("model_revision")),
+        )
+        check(
+            "build reports all 20 documents",
+            build_body.get("document_count") == 20,
+            str(build_body.get("document_count")),
+        )
+        bstats = (await client.get(f"{backend}/admin/stats")).json()
+        check(
+            "build went through batches of at most 8, single-slot",
+            all(len(entry["texts"]) <= 8 for entry in bstats["requests"])
+            and bstats["max_concurrency"] == 1,
+            str([len(entry["texts"]) for entry in bstats["requests"]]),
+        )
+
+        answered = await client.post(
+            f"{gateway}/v1/index/query",
+            json={"query": "smoke document number 7", "timeout_ms": 5000},
+        )
+        check("query returns 200", answered.status_code == 200, answered.text)
+        answer = answered.json()
+        check(
+            "query returns at most 3 matches",
+            0 < len(answer.get("matches", [])) <= 3,
+            str(len(answer.get("matches", []))),
+        )
+        check(
+            "query reports index version and revision",
+            answer.get("index_version") == build_body["index_version"]
+            and answer.get("model_revision") == "smoke-r1",
+            json.dumps(
+                {
+                    "version": answer.get("index_version"),
+                    "revision": answer.get("model_revision"),
+                }
+            ),
+        )
+        top = answer["matches"][0]["id"]
+        check(
+            "most similar document ranks first",
+            top == "doc-7",
+            f"top={top}",
+        )
+
+        # 7. Switching model revision makes the old index unavailable for new
+        #    queries; a rebuild installs a new version.
+        await client.post(f"{backend}/admin/revision", json={"revision": "smoke-r2"})
+        mismatched = await client.post(
+            f"{gateway}/v1/index/query",
+            json={"query": "smoke document number 7", "timeout_ms": 5000},
+        )
+        check(
+            "query under a different revision -> revision_mismatch",
+            mismatched.status_code == 409
+            and mismatched.json().get("error", {}).get("code")
+            == "revision_mismatch",
+            mismatched.text,
+        )
+        old = await client.get(f"{gateway}/v1/index/status")
+        check(
+            "old index is still the installed version",
+            old.json().get("model_revision") == "smoke-r1"
+            and old.json().get("index_version") == build_body["index_version"],
+            old.text,
+        )
+
+        await client.post(f"{backend}/admin/config", json={"mode": "error"})
+        broken = await client.post(
+            f"{gateway}/v1/index/build",
+            json={"documents": docs, "timeout_ms": 5000},
+        )
+        check(
+            "failed rebuild keeps the old index",
+            broken.status_code == 502,
+            broken.text,
+        )
+        await client.post(f"{backend}/admin/config", json={"mode": "ok"})
+        still_old = (await client.get(f"{gateway}/v1/index/status")).json()
+        check(
+            "old index unchanged after failed rebuild",
+            still_old.get("index_version") == build_body["index_version"]
+            and still_old.get("model_revision") == "smoke-r1",
+            json.dumps(still_old),
+        )
+
+        rebuilt = await client.post(
+            f"{gateway}/v1/index/build",
+            json={"documents": docs, "timeout_ms": 10000},
+        )
+        check("rebuild under new revision returns 200", rebuilt.status_code == 200, rebuilt.text)
+        check(
+            "rebuild installs a new version on the new revision",
+            rebuilt.json().get("index_version") == build_body["index_version"] + 1
+            and rebuilt.json().get("model_revision") == "smoke-r2",
+            rebuilt.text,
+        )
+        new_answer = await client.post(
+            f"{gateway}/v1/index/query",
+            json={"query": "smoke document number 7", "timeout_ms": 5000},
+        )
+        check(
+            "query works again on the new index version",
+            new_answer.status_code == 200
+            and new_answer.json().get("index_version")
+            == rebuilt.json().get("index_version"),
+            new_answer.text,
+        )
+
     print()
     print("RESULT:", "ALL CHECKS PASSED" if failures == 0 else f"{failures} FAILURE(S)")
     return 0 if failures == 0 else 1

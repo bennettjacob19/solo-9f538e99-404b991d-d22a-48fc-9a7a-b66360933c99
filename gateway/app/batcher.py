@@ -60,6 +60,9 @@ class PendingRequest:
     state: str = "pending"
     batch_id: str | None = None
     batch_size: int | None = None
+    # Model revision reported by the backend for the batch that served this
+    # request.  ``None`` when the backend does not report one.
+    revision: str | None = None
 
 
 @dataclass
@@ -69,6 +72,7 @@ class BatchResult:
     vectors: list[list[float]]
     batch_id: str
     batch_size: int
+    revision: str | None = None
 
 
 @dataclass
@@ -80,6 +84,7 @@ class BatchRecord:
     finished_at: float | None = None
     outcome: str | None = None
     error: str | None = None
+    revision: str | None = None
 
 
 class BatchScheduler:
@@ -209,6 +214,7 @@ class BatchScheduler:
                         vectors=result_task.result(),
                         batch_id=item.batch_id or "batch-0",
                         batch_size=item.batch_size or len(texts),
+                        revision=item.revision,
                     )
                 # Neither a result nor a confirmed disconnect: deadline hit.
                 self._abandon(item, "timed out")
@@ -400,11 +406,12 @@ class BatchScheduler:
         self._stats["backend_texts_sent"] += len(flat_inputs)
 
         try:
-            vectors = await self._call_backend(model, flat_inputs)
-            per_request = self._split_vectors(batch, vectors)
+            data, revision = await self._call_backend(model, flat_inputs)
+            per_request = self._split_vectors(batch, data)
             for item, item_vectors in zip(batch, per_request):
                 item.batch_id = batch_id
                 item.batch_size = len(flat_inputs)
+                item.revision = revision
                 if item.state == "dispatched" and not item.future.done():
                     item.state = "finished"
                     item.future.set_result(item_vectors)
@@ -412,6 +419,7 @@ class BatchScheduler:
                 elif item.state == "dispatched":
                     item.state = "cancelled"
             record.outcome = "ok"
+            record.revision = revision
         except Exception as exc:  # noqa: BLE001 - must never kill dispatcher
             error = self._as_backend_error(exc)
             self._stats["backend_errors"] += 1
@@ -435,6 +443,7 @@ class BatchScheduler:
                 ),
                 "outcome": record.outcome,
                 "error": record.error,
+                "revision": record.revision,
             }
             # Wake the loop in case submissions arrived during the call; the
             # dispatch loop would otherwise still be parked on the event.
@@ -445,7 +454,7 @@ class BatchScheduler:
 
     async def _call_backend(
         self, model: str, inputs: list[str]
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], str | None]:
         headers = {"content-type": "application/json"}
         if self.settings.backend_api_key:
             headers["authorization"] = f"Bearer {self.settings.backend_api_key}"
@@ -472,7 +481,12 @@ class BatchScheduler:
         data = body.get("data") if isinstance(body, dict) else None
         if not isinstance(data, list):
             raise BackendError("backend response is missing a 'data' list")
-        return data
+        revision = body.get("revision") if isinstance(body, dict) else None
+        if revision is not None and (
+            not isinstance(revision, str) or not revision.strip()
+        ):
+            raise BackendError("backend returned an invalid model revision")
+        return data, revision
 
     def _split_vectors(
         self, batch: list[PendingRequest], data: list[dict[str, Any]]

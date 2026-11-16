@@ -16,8 +16,8 @@ from gateway.app.config import Settings
 from gateway.app.main import create_app
 
 
-def vector_for(text: str, dim: int = 4) -> list[float]:
-    digest = hashlib.sha256(text.encode()).digest()
+def vector_for(text: str, dim: int = 4, revision: str = "rev-1") -> list[float]:
+    digest = hashlib.sha256(f"{revision}\x00{text}".encode()).digest()
     return [round(digest[i] / 255.0, 6) for i in range(dim)]
 
 
@@ -28,6 +28,7 @@ class Call:
     start: float
     end: float | None = None
     status: int | None = None
+    revision: str | None = None
 
 
 @dataclass
@@ -39,16 +40,36 @@ class FakeBackend:
     mode: str = "ok"  # ok | malformed | short | duplicate_index | bad_coalesce
     shuffle: bool = True
     dim: int = 4
+    revision: str = "rev-1"
+    report_revision: bool = True
     calls: list[Call] = field(default_factory=list)
     active: int = 0
     max_active: int = 0
     on_call: Any = None
+    on_revision_get: Any = None
 
     async def __call__(self, request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith(
+            "/model/revision"
+        ):
+            # Only the current revision exists; no history is kept.
+            revision = self.revision
+            if self.on_revision_get is not None:
+                await self.on_revision_get()
+            return httpx.Response(200, json={"revision": revision})
+
         loop = asyncio.get_running_loop()
         body = json.loads(request.content)
         texts = body["input"]
-        call = Call(texts=list(texts), model=body.get("model", ""), start=loop.time())
+        # Pin the revision when inference starts; later switches must not
+        # rewrite this result.
+        revision = self.revision
+        call = Call(
+            texts=list(texts),
+            model=body.get("model", ""),
+            start=loop.time(),
+            revision=revision,
+        )
         self.calls.append(call)
         self.active += 1
         self.max_active = max(self.max_active, self.active)
@@ -74,7 +95,7 @@ class FakeBackend:
                 {
                     "object": "embedding",
                     "index": index,
-                    "embedding": vector_for(text, self.dim),
+                    "embedding": vector_for(text, self.dim, revision),
                 }
                 for index, text in enumerate(emitted)
             ]
@@ -82,9 +103,14 @@ class FakeBackend:
                 data[1]["index"] = 0
             if self.shuffle:
                 data.reverse()
-            return httpx.Response(
-                200, json={"object": "list", "data": data, "model": "fake"}
-            )
+            payload: dict[str, Any] = {
+                "object": "list",
+                "data": data,
+                "model": "fake",
+            }
+            if self.report_revision:
+                payload["revision"] = revision
+            return httpx.Response(200, json=payload)
         finally:
             call.end = loop.time()
             self.active -= 1
@@ -101,6 +127,7 @@ class FakeBackend:
 def make_settings(**overrides: Any) -> Settings:
     defaults: dict[str, Any] = {
         "backend_url": "http://fake.test/v1/embeddings",
+        "backend_revision_url": "http://fake.test/v1/model/revision",
         "backend_model": "fake-model",
         "backend_timeout_seconds": 10.0,
         "backend_connect_timeout_seconds": 2.0,
